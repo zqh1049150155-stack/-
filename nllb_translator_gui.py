@@ -6,6 +6,7 @@ import threading
 import psutil
 import os
 import sys
+import re
 
 # 检查sentencepiece是否安装
 try:
@@ -36,6 +37,38 @@ class NLLBTranslatorGUI:
         
         # 自动加载模型（延迟500ms，等界面显示完成）
         self.root.after(500, self.load_model_thread)
+
+    @staticmethod
+    def merge_with_overlap(existing_text, new_text, max_overlap=40):
+        """合并文本并移除首尾重叠，减少上下文拼接造成的重复。"""
+        if not existing_text:
+            return new_text
+
+        normalized_existing = existing_text.rstrip()
+        normalized_new = new_text.lstrip()
+        max_check = min(max_overlap, len(normalized_existing), len(normalized_new))
+
+        overlap = 0
+        for size in range(max_check, 0, -1):
+            if normalized_existing[-size:] == normalized_new[:size]:
+                overlap = size
+                break
+
+        return f"{normalized_existing}{normalized_new[overlap:]}"
+
+    @staticmethod
+    def build_context_segment(segments, index, context_window=2):
+        """构建带上下文的片段：当前片段 + 前文窗口。"""
+        start = max(0, index - context_window)
+        context_parts = segments[start:index]
+        current = segments[index]
+
+        # 使用简洁分隔符连接，给模型提供前文语境，显存仅小幅增加
+        if not context_parts:
+            return current
+
+        context = " ".join(context_parts)
+        return f"{context}\n\n{current}"
         
     def create_widgets(self):
         # 顶部状态栏
@@ -436,7 +469,6 @@ class NLLBTranslatorGUI:
             self.segment_translate_button.config(state=tk.DISABLED, text="翻译中...")
             
             # 分段逻辑：按句号、问号、感叹号分段
-            import re
             # 支持中英文标点
             sentences = re.split(r'([.!?。！？\n]+)', input_text)
             
@@ -481,13 +513,23 @@ class NLLBTranslatorGUI:
             total_segments = len(segments)
             self.status_bar.config(text=f"分为{total_segments}段，开始翻译...")
             
-            # 翻译每个片段
+            # 翻译每个片段（加入前文上下文窗口，提升连贯性）
             translated_segments = []
+            context_window = 2
             for idx, segment in enumerate(segments, 1):
                 self.status_bar.config(text=f"正在翻译第{idx}/{total_segments}段...")
+
+                # 对每个分段拼接有限前文，提升代词/省略句翻译准确度
+                contextual_segment = self.build_context_segment(segments, idx - 1, context_window)
                 
                 # 编码
-                inputs = self.tokenizer(segment, return_tensors="pt", padding=True)
+                inputs = self.tokenizer(
+                    contextual_segment,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=768
+                )
                 
                 if self.device == "cuda":
                     inputs = {k: v.to(self.device) for k, v in inputs.items()}
@@ -505,15 +547,17 @@ class NLLBTranslatorGUI:
                 translated_text = self.tokenizer.batch_decode(
                     translated_tokens, skip_special_tokens=True
                 )[0]
-                
-                translated_segments.append(translated_text)
+
+                translated_segments.append(translated_text.strip())
                 
                 # 清理显存
                 if self.device == "cuda":
                     torch.cuda.empty_cache()
             
-            # 合并翻译结果
-            final_translation = " ".join(translated_segments)
+            # 合并翻译结果，尽量消除上下文窗口带来的重复
+            final_translation = ""
+            for translated_segment in translated_segments:
+                final_translation = self.merge_with_overlap(final_translation, translated_segment)
             
             # 显示结果
             self.output_text.config(state=tk.NORMAL)
