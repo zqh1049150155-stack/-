@@ -26,6 +26,7 @@ class NLLBTranslatorGUI:
         self.model = None
         self.tokenizer = None
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.context_overlap_chars = 80
         
         # 创建界面
         self.create_widgets()
@@ -132,6 +133,18 @@ class NLLBTranslatorGUI:
                                                  font=("Arial", 11, "bold"), bg="#FF9800", fg="white",
                                                  width=12, height=2, state=tk.DISABLED)
         self.segment_translate_button.pack(side=tk.LEFT, padx=10)
+
+        # 上下文连接选项（小幅增加显存占用，提升分段翻译连贯性）
+        self.context_mode_var = tk.BooleanVar(value=True)
+        self.context_mode_check = tk.Checkbutton(
+            button_frame,
+            text="上下文连接",
+            variable=self.context_mode_var,
+            font=("Arial", 10),
+            onvalue=True,
+            offvalue=False
+        )
+        self.context_mode_check.pack(side=tk.LEFT, padx=8)
         
         self.clear_button = tk.Button(button_frame, text="清空", 
                                      command=self.clear_text,
@@ -394,6 +407,30 @@ class NLLBTranslatorGUI:
         thread = threading.Thread(target=self.segment_translate)
         thread.daemon = True
         thread.start()
+
+    def build_contextual_segment(self, segment, previous_segment):
+        """构建带上下文的片段输入，提升跨句连贯性"""
+        if not self.context_mode_var.get() or not previous_segment:
+            return segment
+
+        # 仅拼接上一段尾部，控制显存增量
+        context = previous_segment[-self.context_overlap_chars:]
+        return f"{context}\n{segment}"
+
+    def merge_translation_with_overlap(self, merged_translation, previous_translation):
+        """去除因上下文重复导致的翻译前缀重叠"""
+        if not previous_translation:
+            return merged_translation
+
+        max_overlap = min(len(previous_translation), len(merged_translation), 80)
+        overlap_size = 0
+
+        for size in range(max_overlap, 0, -1):
+            if previous_translation[-size:] == merged_translation[:size]:
+                overlap_size = size
+                break
+
+        return merged_translation[overlap_size:]
     
     def segment_translate(self):
         """分段翻译 - 提高长文本翻译质量"""
@@ -481,13 +518,17 @@ class NLLBTranslatorGUI:
             total_segments = len(segments)
             self.status_bar.config(text=f"分为{total_segments}段，开始翻译...")
             
-            # 翻译每个片段
+            # 翻译每个片段（可选上下文连接）
             translated_segments = []
+            previous_source_segment = ""
+            previous_translation = ""
             for idx, segment in enumerate(segments, 1):
                 self.status_bar.config(text=f"正在翻译第{idx}/{total_segments}段...")
+
+                contextual_segment = self.build_contextual_segment(segment, previous_source_segment)
                 
                 # 编码
-                inputs = self.tokenizer(segment, return_tensors="pt", padding=True)
+                inputs = self.tokenizer(contextual_segment, return_tensors="pt", padding=True)
                 
                 if self.device == "cuda":
                     inputs = {k: v.to(self.device) for k, v in inputs.items()}
@@ -505,8 +546,16 @@ class NLLBTranslatorGUI:
                 translated_text = self.tokenizer.batch_decode(
                     translated_tokens, skip_special_tokens=True
                 )[0]
+
+                if self.context_mode_var.get():
+                    translated_text = self.merge_translation_with_overlap(
+                        translated_text,
+                        previous_translation
+                    )
                 
                 translated_segments.append(translated_text)
+                previous_source_segment = segment
+                previous_translation = translated_text
                 
                 # 清理显存
                 if self.device == "cuda":
@@ -521,7 +570,8 @@ class NLLBTranslatorGUI:
             self.output_text.insert("1.0", final_translation)
             self.output_text.config(state=tk.DISABLED)
             
-            self.status_bar.config(text=f"分段翻译完成！(共{total_segments}段)")
+            mode_text = "上下文连接开启" if self.context_mode_var.get() else "标准模式"
+            self.status_bar.config(text=f"分段翻译完成！(共{total_segments}段, {mode_text})")
             self.translate_button.config(state=tk.NORMAL)
             self.segment_translate_button.config(state=tk.NORMAL, text="分段翻译")
             
